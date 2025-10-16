@@ -1,0 +1,11 @@
+```pip-requirements
+fastapi
+uvicorn
+
+```
+fastapi==0.119.0
+uvicorn[standard]==0.22.0
+websockets==11.2.3
+
+fastapi
+uvicorn
