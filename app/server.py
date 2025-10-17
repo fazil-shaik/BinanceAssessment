@@ -1,6 +1,8 @@
 import asyncio
 import logging
 from typing import List
+import time
+from typing import Dict
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -28,80 +30,145 @@ def create_app(symbols: List[str] = None) -> FastAPI:
 
 
     @app.get("/price")
-    async def get_price():
-        # If we have cached prices, return them immediately
-        if latest_prices:
-            return latest_prices
+    async def get_price(symbols: str = None):
+        """Return latest prices.
 
-        # On serverless platforms the background Binance websocket listeners
-        # may not be running. Fall back to querying Binance REST API for a
-        # small set of symbols so /price still works in production.
+        - `symbols` optional comma-separated list (e.g. BTCUSDT,ETHUSDT)
+        - Returns a dict keyed by symbol with payloads matching the websocket format:
+          {symbol: {symbol, last_price, change_pct, timestamp}}
+        """
+
+        # build requested symbol list
+        if symbols:
+            req = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        else:
+            # if caller doesn't specify, return defaults (either cached or latest_prices keys)
+            req = []
+
+        result: Dict[str, Dict] = {}
+
+        # helper to normalize symbol keys used in latest_prices (Binance uses uppercase symbols like BTCUSDT)
+        def norm(sym: str) -> str:
+            return sym.upper()
+
+        # first, try to populate from in-memory websocket cache
+        if latest_prices:
+            for k, v in latest_prices.items():
+                ks = norm(k)
+                if not req or ks in req:
+                    result[ks] = v
+
+        # module-level short-lived fallback cache (to make cold starts faster)
+        # key: SYMBOL (upper) -> {payload, ts}
+        # TTL seconds
+        CACHE_TTL = 5
+        try:
+            cache = getattr(app.state, "fallback_cache")
+        except Exception:
+            cache = {}
+            app.state.fallback_cache = cache
+
+        now = int(time.time() * 1000)
+
+        # symbols still needed
+        needed = []
+        if req:
+            for s in req:
+                if s in result:
+                    continue
+                entry = cache.get(s)
+                if entry and (now - entry["ts"]) <= CACHE_TTL * 1000:
+                    result[s] = entry["payload"]
+                else:
+                    needed.append(s)
+        else:
+            # if no specific req provided, but result empty, we can try to return cached defaults
+            if not result:
+                # try to use cached entries for any symbols present
+                for s, entry in list(cache.items()):
+                    if (now - entry["ts"]) <= CACHE_TTL * 1000:
+                        result[s] = entry["payload"]
+                # if still empty, allow fetching defaults
+                if not result:
+                    needed = ["BTCUSDT", "ETHUSDT"]
+
+        # if nothing needed, return result
+        if not needed:
+            return result
+
+        # For any needed symbols, try to fetch from CoinGecko in one call (fast public API)
         try:
             import httpx
 
-            symbols = ["BTCUSDT", "ETHUSDT"]
-            results = {}
-            logger.info("/price fallback: querying Binance REST for symbols: %s", symbols)
+            # build CoinGecko ids mapping dynamically for common symbols
+            mapping = {
+                "BTC": "bitcoin",
+                "ETH": "ethereum",
+                "BNB": "binancecoin",
+                "ADA": "cardano",
+                "DOGE": "dogecoin",
+            }
 
-            # small retry loop (2 attempts)
-            attempt = 0
-            timeout_seconds = 20.0
-            while attempt < 2 and not results:
-                attempt += 1
-                logger.info("/price fallback: attempt %s", attempt)
-                async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-                    for sym in symbols:
+            # determine which coin ids we can query
+            id_map = {}
+            for s in needed:
+                base = s.upper()
+                if base.endswith("USDT"):
+                    base = base[:-4]
+                cid = mapping.get(base)
+                if cid:
+                    id_map[s] = cid
+
+            if id_map:
+                ids = ",".join(sorted(set(id_map.values())))
+                cg_url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    r = await client.get(cg_url)
+                    if r.status_code == 200:
+                        data = r.json()
+                        for sym, cid in id_map.items():
+                            obj = data.get(cid)
+                            if obj and "usd" in obj:
+                                payload = {
+                                    "symbol": sym,
+                                    "last_price": str(obj.get("usd")),
+                                    "change_pct": None,
+                                    "timestamp": now,
+                                }
+                                result[sym] = payload
+                                cache[sym] = {"payload": payload, "ts": now}
+
+        except Exception as e:
+            logger.debug("/price fallback: CoinGecko fetch failed: %s", e)
+
+        # Any remaining needed symbols: try Binance REST quickly (short timeout)
+        remaining = [s for s in needed if s not in result]
+        if remaining:
+            try:
+                import httpx
+
+                async with httpx.AsyncClient(timeout=3.0) as client:
+                    for sym in remaining:
                         url = f"https://api.binance.com/api/v3/ticker/price?symbol={sym}"
                         try:
                             r = await client.get(url)
-                        except Exception as e:
-                            logger.warning("/price fallback: request error for %s: %s", url, e)
+                            if r.status_code == 200:
+                                data = r.json()
+                                payload = {
+                                    "symbol": sym,
+                                    "last_price": data.get("price"),
+                                    "change_pct": None,
+                                    "timestamp": now,
+                                }
+                                result[sym] = payload
+                                cache[sym] = {"payload": payload, "ts": now}
+                        except Exception:
                             continue
+            except Exception:
+                pass
 
-                        logger.info("/price fallback: %s -> status %s", url, r.status_code)
-                        if r.status_code == 200:
-                            data = r.json()
-                            results[data.get("symbol")] = {"last_price": data.get("price")}
-
-                if not results:
-                    await asyncio.sleep(0.5)
-
-            if results:
-                logger.info("/price fallback: returning results: %s", list(results.keys()))
-                return results
-            # nothing returned from Binance REST fallback — try CoinGecko as a public alternative
-            logger.info("/price fallback: trying CoinGecko as alternative")
-            try:
-                # map target symbols to CoinGecko ids
-                mapping = {"BTCUSDT": "bitcoin", "ETHUSDT": "ethereum"}
-                ids = ",".join(mapping.values())
-                cg_url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    r = await client.get(cg_url)
-                    logger.info("/price fallback: CoinGecko -> status %s", r.status_code)
-                    if r.status_code == 200:
-                        data = r.json()
-                        cg_results = {}
-                        for sym, cid in mapping.items():
-                            price = None
-                            obj = data.get(cid)
-                            if obj:
-                                # use the usd price and format as string to match other responses
-                                price = str(obj.get("usd"))
-                            if price is not None:
-                                cg_results[sym] = {"last_price": price}
-                        if cg_results:
-                            logger.info("/price fallback: returning CoinGecko results: %s", list(cg_results.keys()))
-                            return cg_results
-            except Exception as e:
-                logger.warning("/price fallback: CoinGecko attempt failed: %s", e)
-
-            # still nothing; return an informative error
-            logger.warning("/price fallback: no results after all fallbacks; returning error")
-            return JSONResponse(status_code=502, content={"error": "no prices available (all fallbacks failed)"})
-        except Exception as e:
-            logger.exception("/price fallback: unexpected exception: %s", e)
-            return JSONResponse(status_code=502, content={"error": "fallback exception", "details": str(e)})
+        # Return whatever we have (could be partial). Ensure values follow the payload shape.
+        return result
 
 
     @app.get("/price_debug")
