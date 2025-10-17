@@ -69,10 +69,36 @@ def create_app(symbols: List[str] = None) -> FastAPI:
             if results:
                 logger.info("/price fallback: returning results: %s", list(results.keys()))
                 return results
+            # nothing returned from Binance REST fallback — try CoinGecko as a public alternative
+            logger.info("/price fallback: trying CoinGecko as alternative")
+            try:
+                # map target symbols to CoinGecko ids
+                mapping = {"BTCUSDT": "bitcoin", "ETHUSDT": "ethereum"}
+                ids = ",".join(mapping.values())
+                cg_url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    r = await client.get(cg_url)
+                    logger.info("/price fallback: CoinGecko -> status %s", r.status_code)
+                    if r.status_code == 200:
+                        data = r.json()
+                        cg_results = {}
+                        for sym, cid in mapping.items():
+                            price = None
+                            obj = data.get(cid)
+                            if obj:
+                                # use the usd price and format as string to match other responses
+                                price = str(obj.get("usd"))
+                            if price is not None:
+                                cg_results[sym] = {"last_price": price}
+                        if cg_results:
+                            logger.info("/price fallback: returning CoinGecko results: %s", list(cg_results.keys()))
+                            return cg_results
+            except Exception as e:
+                logger.warning("/price fallback: CoinGecko attempt failed: %s", e)
 
-            # nothing returned from REST fallback
-            logger.warning("/price fallback: no results after retries; returning error")
-            return JSONResponse(status_code=502, content={"error": "no prices available (fallback failed)"})
+            # still nothing; return an informative error
+            logger.warning("/price fallback: no results after all fallbacks; returning error")
+            return JSONResponse(status_code=502, content={"error": "no prices available (all fallbacks failed)"})
         except Exception as e:
             logger.exception("/price fallback: unexpected exception: %s", e)
             return JSONResponse(status_code=502, content={"error": "fallback exception", "details": str(e)})
@@ -101,6 +127,19 @@ def create_app(symbols: List[str] = None) -> FastAPI:
                         attempts.append({"symbol": sym, "url": url, "status_code": r.status_code, "text": r.text[:500]})
                     except Exception as e:
                         attempts.append({"symbol": sym, "url": url, "error": str(e)})
+
+                # also attempt CoinGecko for diagnostics
+                try:
+                    mapping = {"BTCUSDT": "bitcoin", "ETHUSDT": "ethereum"}
+                    ids = ",".join(mapping.values())
+                    cg_url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
+                    try:
+                        r = await client.get(cg_url)
+                        info["coingecko"] = {"status_code": r.status_code, "text": r.text[:500]}
+                    except Exception as e:
+                        info["coingecko_error"] = str(e)
+                except Exception:
+                    pass
         except Exception as e:
             info["import_error"] = str(e)
 
