@@ -3,6 +3,7 @@ import logging
 from typing import List
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 
 from .config import LOG_LEVEL
 from .manager import manager
@@ -41,24 +42,70 @@ def create_app(symbols: List[str] = None) -> FastAPI:
             symbols = ["BTCUSDT", "ETHUSDT"]
             results = {}
             logger.info("/price fallback: querying Binance REST for symbols: %s", symbols)
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                for sym in symbols:
-                    url = f"https://api.binance.com/api/v3/ticker/price?symbol={sym}"
-                    r = await client.get(url)
-                    logger.info("/price fallback: %s -> status %s", url, r.status_code)
-                    if r.status_code == 200:
-                        data = r.json()
-                        results[data.get("symbol")] = {"last_price": data.get("price")}
+
+            # small retry loop (2 attempts)
+            attempt = 0
+            timeout_seconds = 20.0
+            while attempt < 2 and not results:
+                attempt += 1
+                logger.info("/price fallback: attempt %s", attempt)
+                async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                    for sym in symbols:
+                        url = f"https://api.binance.com/api/v3/ticker/price?symbol={sym}"
+                        try:
+                            r = await client.get(url)
+                        except Exception as e:
+                            logger.warning("/price fallback: request error for %s: %s", url, e)
+                            continue
+
+                        logger.info("/price fallback: %s -> status %s", url, r.status_code)
+                        if r.status_code == 200:
+                            data = r.json()
+                            results[data.get("symbol")] = {"last_price": data.get("price")}
+
+                if not results:
+                    await asyncio.sleep(0.5)
 
             if results:
                 logger.info("/price fallback: returning results: %s", list(results.keys()))
                 return results
-            else:
-                logger.info("/price fallback: no results from Binance REST")
-        except Exception as e:
-            logger.warning("/price fallback: exception during HTTP fetch: %s", e)
 
-        return latest_prices
+            # nothing returned from REST fallback
+            logger.warning("/price fallback: no results after retries; returning error")
+            return JSONResponse(status_code=502, content={"error": "no prices available (fallback failed)"})
+        except Exception as e:
+            logger.exception("/price fallback: unexpected exception: %s", e)
+            return JSONResponse(status_code=502, content={"error": "fallback exception", "details": str(e)})
+
+
+    @app.get("/price_debug")
+    async def price_debug():
+        """Diagnostic endpoint to show what the fallback does in production.
+
+        Returns a detailed JSON with whether cached prices exist and the results
+        or errors from attempting to query Binance REST.
+        """
+        info = {"latest_prices_present": bool(latest_prices), "latest_prices_keys": list(latest_prices.keys())}
+
+        # attempt single REST fetch and capture detailed results
+        attempts = []
+        try:
+            import httpx
+
+            symbols = ["BTCUSDT", "ETHUSDT"]
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                for sym in symbols:
+                    url = f"https://api.binance.com/api/v3/ticker/price?symbol={sym}"
+                    try:
+                        r = await client.get(url)
+                        attempts.append({"symbol": sym, "url": url, "status_code": r.status_code, "text": r.text[:500]})
+                    except Exception as e:
+                        attempts.append({"symbol": sym, "url": url, "error": str(e)})
+        except Exception as e:
+            info["import_error"] = str(e)
+
+        info["attempts"] = attempts
+        return info
 
 
     @app.on_event("startup")
