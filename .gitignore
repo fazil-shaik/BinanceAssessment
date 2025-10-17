@@ -3,3 +3,5 @@ myenv
 __pycache__
 *.pyc
 *.pyo
+app/__pycache__
+.vercel
