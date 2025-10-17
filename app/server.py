@@ -28,6 +28,32 @@ def create_app(symbols: List[str] = None) -> FastAPI:
 
     @app.get("/price")
     async def get_price():
+        # If we have cached prices, return them immediately
+        if latest_prices:
+            return latest_prices
+
+        # On serverless platforms the background Binance websocket listeners
+        # may not be running. Fall back to querying Binance REST API for a
+        # small set of symbols so /price still works in production.
+        try:
+            import httpx
+
+            symbols = ["BTCUSDT", "ETHUSDT"]
+            results = {}
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                for sym in symbols:
+                    url = f"https://api.binance.com/api/v3/ticker/price?symbol={sym}"
+                    r = await client.get(url)
+                    if r.status_code == 200:
+                        data = r.json()
+                        results[data.get("symbol")] = {"last_price": data.get("price")}
+
+            if results:
+                return results
+        except Exception:
+            # ignore network errors and fall through to return empty dict
+            pass
+
         return latest_prices
 
 
