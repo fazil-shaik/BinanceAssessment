@@ -40,19 +40,23 @@ def create_app(symbols: List[str] = None) -> FastAPI:
 
             symbols = ["BTCUSDT", "ETHUSDT"]
             results = {}
+            logger.info("/price fallback: querying Binance REST for symbols: %s", symbols)
             async with httpx.AsyncClient(timeout=10.0) as client:
                 for sym in symbols:
                     url = f"https://api.binance.com/api/v3/ticker/price?symbol={sym}"
                     r = await client.get(url)
+                    logger.info("/price fallback: %s -> status %s", url, r.status_code)
                     if r.status_code == 200:
                         data = r.json()
                         results[data.get("symbol")] = {"last_price": data.get("price")}
 
             if results:
+                logger.info("/price fallback: returning results: %s", list(results.keys()))
                 return results
-        except Exception:
-            # ignore network errors and fall through to return empty dict
-            pass
+            else:
+                logger.info("/price fallback: no results from Binance REST")
+        except Exception as e:
+            logger.warning("/price fallback: exception during HTTP fetch: %s", e)
 
         return latest_prices
 
